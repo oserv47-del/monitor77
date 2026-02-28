@@ -13,10 +13,16 @@ app.use(cors());
 app.use(express.json());
 
 // ==================== Environment Variables ====================
+// Set these on Render:
+// TELEGRAM_TOKEN=7357354055:AAH4W-B0qIRBRiNgts6KmeRRTUARauqwOMY
+// SUPABASE_URL=https://tozmgpxuevooslhywjpc.supabase.co
+// SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvem1ncHh1ZXZvb3NsaHl3anBjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjI1MDI5NCwiZXhwIjoyMDg3ODI2Mjk0fQ.1nJP19jqeqQ8lFg-0qvNlhHP4h6-vG-r5QufnrFsk1I
+// SERVER_URL=https://your-app.onrender.com (your actual Render URL)
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; // Use service role key for admin
-const SERVER_URL = process.env.SERVER_URL; // e.g., https://yourapp.onrender.com
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SERVER_URL = process.env.SERVER_URL;
 
 if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('Missing required environment variables');
@@ -119,7 +125,7 @@ app.post('/webhook', (req, res) => {
       deviceSocket.emit('command', { command: text, chatId });
       res.sendStatus(200);
     } else {
-      // Device not connected, store as pending? For now, notify user
+      // Device not connected, notify user
       bot.sendMessage(chatId, 'Device is offline or not registered.')
         .catch(err => console.error(err));
       res.sendStatus(200);
