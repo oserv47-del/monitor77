@@ -13,12 +13,6 @@ app.use(cors());
 app.use(express.json());
 
 // ==================== Environment Variables ====================
-// Set these on Render:
-// TELEGRAM_TOKEN=7357354055:AAH4W-B0qIRBRiNgts6KmeRRTUARauqwOMY
-// SUPABASE_URL=https://tozmgpxuevooslhywjpc.supabase.co
-// SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvem1ncHh1ZXZvb3NsaHl3anBjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjI1MDI5NCwiZXhwIjoyMDg3ODI2Mjk0fQ.1nJP19jqeqQ8lFg-0qvNlhHP4h6-vG-r5QufnrFsk1I
-// SERVER_URL=https://your-app.onrender.com (your actual Render URL)
-
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -43,8 +37,7 @@ if (SERVER_URL) {
 }
 
 // ==================== Store connected devices ====================
-// Map deviceId -> socket
-const devices = new Map();
+const devices = new Map(); // deviceId -> socket
 
 // ==================== Helper: Store command result in Supabase ====================
 async function storeResult(deviceId, command, result, type = null) {
@@ -91,9 +84,7 @@ io.on('connection', (socket) => {
     const { command, result, chatId, type } = data;
     const deviceId = socket.deviceId;
     if (deviceId) {
-      // Store in Supabase
       await storeResult(deviceId, command, result, type);
-      // If command came from Telegram, forward result to Telegram
       if (chatId) {
         bot.sendMessage(chatId, result).catch(err => {
           console.error('Failed to send Telegram message:', err);
@@ -116,16 +107,13 @@ app.post('/webhook', (req, res) => {
   if (update.message) {
     const chatId = update.message.chat.id;
     const text = update.message.text;
-    // Use chat ID as device ID (or you could map multiple devices)
-    const deviceId = chatId.toString();
+    const deviceId = chatId.toString(); // assuming one device per chat
 
     const deviceSocket = devices.get(deviceId);
     if (deviceSocket) {
-      // Forward command to device
       deviceSocket.emit('command', { command: text, chatId });
       res.sendStatus(200);
     } else {
-      // Device not connected, notify user
       bot.sendMessage(chatId, 'Device is offline or not registered.')
         .catch(err => console.error(err));
       res.sendStatus(200);
@@ -147,7 +135,6 @@ app.post('/sendCommand', async (req, res) => {
     deviceSocket.emit('command', { command, chatId: null });
     res.json({ status: 'sent' });
   } else {
-    // Check if device exists in database but offline
     const { data, error } = await supabase
       .from('devices')
       .select('id')
@@ -161,9 +148,9 @@ app.post('/sendCommand', async (req, res) => {
   }
 });
 
-// ==================== API Endpoints to Query Data ====================
+// ==================== API Endpoints for Termux Device Selection ====================
 
-// Get all registered devices
+// Get all registered devices (for Termux to list)
 app.get('/api/devices', async (req, res) => {
   const { data, error } = await supabase
     .from('devices')
@@ -173,7 +160,7 @@ app.get('/api/devices', async (req, res) => {
   res.json(data);
 });
 
-// Get command results for a device (with optional limit)
+// Get command results for a device
 app.get('/api/results/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
   const limit = parseInt(req.query.limit) || 50;
@@ -187,7 +174,7 @@ app.get('/api/results/:deviceId', async (req, res) => {
   res.json(data);
 });
 
-// Get latest result of a specific type for a device (e.g., last location)
+// Get latest result of a specific type
 app.get('/api/latest/:deviceId/:type', async (req, res) => {
   const { deviceId, type } = req.params;
   const { data, error } = await supabase
