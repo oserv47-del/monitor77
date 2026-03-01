@@ -1,37 +1,71 @@
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
+const WebSocket = require("ws");
+const { RtcTokenBuilder, RtcRole } = require("agora-access-token");
 
 const app = express();
-app.use(express.json());
+const server = require("http").createServer(app);
+const wss = new WebSocket.Server({ server });
 
-const token = process.env.BOT_TOKEN;
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+
 const ADMIN_ID = process.env.ADMIN_ID;
 
-const bot = new TelegramBot(token, { polling: true });
+let androidSocket = null;
 
-let streamStatus = false;
+wss.on("connection", (ws) => {
+    androidSocket = ws;
+});
 
-// Start Stream
+// Generate Agora Token
+function generateToken(channel) {
+    const appID = process.env.AGORA_APP_ID;
+    const appCertificate = process.env.AGORA_CERT;
+
+    const uid = 0;
+    const role = RtcRole.PUBLISHER;
+    const expireTime = 3600;
+    const currentTime = Math.floor(Date.now() / 1000);
+    const privilegeExpireTime = currentTime + expireTime;
+
+    return RtcTokenBuilder.buildTokenWithUid(
+        appID,
+        appCertificate,
+        channel,
+        uid,
+        role,
+        privilegeExpireTime
+    );
+}
+
 bot.onText(/\/start_stream/, (msg) => {
     if (msg.chat.id.toString() !== ADMIN_ID) return;
 
-    streamStatus = true;
-    bot.sendMessage(msg.chat.id, "✅ Stream Started");
+    const channel = "educationLive";
+    const token = generateToken(channel);
+
+    if (androidSocket) {
+        androidSocket.send(JSON.stringify({
+            action: "start",
+            channel,
+            token
+        }));
+    }
+
+    const streamLink = `https://viewer.yoursite.com/?channel=${channel}`;
+    bot.sendMessage(msg.chat.id, `✅ Stream Started\n${streamLink}`);
 });
 
-// Stop Stream
 bot.onText(/\/stop_stream/, (msg) => {
     if (msg.chat.id.toString() !== ADMIN_ID) return;
 
-    streamStatus = false;
+    if (androidSocket) {
+        androidSocket.send(JSON.stringify({
+            action: "stop"
+        }));
+    }
+
     bot.sendMessage(msg.chat.id, "🛑 Stream Stopped");
 });
 
-// Status API for Android
-app.get("/status", (req, res) => {
-    res.json({ stream: streamStatus });
-});
-
-app.listen(process.env.PORT || 3000, () => {
-    console.log("Server Running...");
-});
+server.listen(process.env.PORT || 3000);
