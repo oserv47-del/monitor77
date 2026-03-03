@@ -3,8 +3,8 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
 // ================= CONFIGURATION =================
-const TELEGRAM_TOKEN = 'YOUR_BOT_TOKEN'; // Replace with your bot token
-const ALLOWED_CHAT_ID = 'YOUR_CHAT_ID';   // Replace with your Telegram user ID
+const TELEGRAM_TOKEN = '8586296193:AAEIux2yt8IZ_9grKY-V9y5Zuvb1phGxwlo'; // Replace with your bot token
+const ALLOWED_CHAT_ID = '5913394915';   // Replace with your Telegram user ID
 
 // This will be set by the user via /seturl command
 let devicePublicUrl = null;
