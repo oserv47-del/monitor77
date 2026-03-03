@@ -9,8 +9,8 @@ from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, filters
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.environ.get('BOT_TOKEN')           # Your bot token
-OWNER_CHAT_ID = os.environ.get('OWNER_CHAT_ID')   # Optional: restrict to a single user (int)
+BOT_TOKEN = os.environ.get('8586296193:AAEIux2yt8IZ_9grKY-V9y5Zuvb1phGxwlo')           # Your bot token
+OWNER_CHAT_ID = os.environ.get('5913394915')   # Optional: restrict to a single user (int)
 # ----------------------------
 
 app = Flask(__name__)
