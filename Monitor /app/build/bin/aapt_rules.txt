@@ -1,0 +1,24 @@
+# view AndroidManifest.xml #generated:134
+-keep class com.monitor.KeepAliveReceiver { <init>(...); }
+
+# view AndroidManifest.xml #generated:78
+-keep class com.monitor.MainActivity { <init>(...); }
+
+# view AndroidManifest.xml #generated:172
+-keep class com.monitor.MyAccessibilityService { <init>(...); }
+
+# view AndroidManifest.xml #generated:154
+-keep class com.monitor.MyAdminReceiver { <init>(...); }
+
+# view AndroidManifest.xml #generated:112
+-keep class com.monitor.PlayerActivity { <init>(...); }
+
+# view AndroidManifest.xml #generated:117
+-keep class com.monitor.ScreenshotActivity { <init>(...); }
+
+# view AndroidManifest.xml #generated:128
+-keep class com.monitor.ScreenshotService { <init>(...); }
+
+# view AndroidManifest.xml #generated:122
+-keep class com.monitor.TelegramService { <init>(...); }
+
